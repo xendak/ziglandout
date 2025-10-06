@@ -62,6 +62,7 @@ const WL_SHM_POOL_ENUM_FORMAT_ARGB8888 = 0;
 const WL_SHM_POOL_REQUEST_CREATE_BUFFER = 0;
 
 const Vec2 = @Vector(2, f32);
+const Vec3 = @Vector(3, f32);
 
 const Color = struct {
     r: u8,
@@ -467,7 +468,7 @@ pub fn main() !void {
     // create shared memory pool
     // allocate proper wl_buffer  (wl_shm_pool::create_buffer)
 
-    const framebuffer_size = [2]usize{ 1600, 900 };
+    const framebuffer_size = [2]usize{ 512, 512 };
 
     const shm_fd = try std.posix.memfd_create("zigland_framebuffer", 0);
     defer std.posix.close(shm_fd);
@@ -535,7 +536,7 @@ pub fn main() !void {
         },
     };
 
-    drawScene(scene, framebuffer, framebuffer_size);
+    // drawScene(scene, framebuffer, framebuffer_size, 0);
 
     // Attach Surface -> mark as Damaged Surface -> Commit Surface -> event loop
     // id, x, y => offset for buffer
@@ -582,17 +583,23 @@ pub fn main() !void {
 
     // trying to time movement
     var timer = try std.time.Timer.start();
-    var last_time: u64 = 0;
-    var accumulator: f64 = 0;
+    // var last_time: u64 = 0;
 
+    const framerate: u32 = 60;
+    const duration_seconds: f32 = 6.283;
+    var total_frames: u32 = @intFromFloat(duration_seconds * @as(f32, @floatFromInt(framerate)));
+
+    // const time_step: f32 = 1.0 / @as(f32, @floatFromInt(framerate));
+
+    var stdout_buffer: [framebuffer_size[0] * framebuffer_size[1]]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
     while (window_open) {
-        const current_time = timer.read();
-        const delta_nanos = current_time - last_time;
-        last_time = current_time;
-        const delta_time = @as(f64, @floatFromInt(delta_nanos)) / 1_000_000_000.0;
-        accumulator += delta_time;
-        // TODO: track fps? render != game update
-        //
+        // const current_time = timer.read();
+        // const delta_nanos = current_time - last_time;
+        // last_time = current_time;
+        // const delta_time = @as(f64, @floatFromInt(delta_nanos)) / 1_000_000_000.0;
+        // _ = delta_time;
 
         const event = try Event.read(socket, &message);
         if (xdg_surface_id == event.header.id) {
@@ -705,7 +712,7 @@ pub fn main() !void {
                     std.log.debug("Mouse Enter: .serial = {any} .time = {any} .button = {any} .state = {any}\n", .{ serial, time, button, state });
                 },
                 else => {
-                    std.log.warn("Mouse event not tracked {{ .id = {any}, .op = {x}, .message = \"{any}\" }}", .{ event.header.id, event.header.op, std.zig.fmtString(std.mem.sliceAsBytes(event.data)) });
+                    std.log.debug("Mouse event not tracked {{ .id = {any}, .op = {x}, .message = \"{any}\" }}", .{ event.header.id, event.header.op, std.zig.fmtString(std.mem.sliceAsBytes(event.data)) });
                 },
             }
         } else if (event.header.id == wl_keyboard) {
@@ -747,10 +754,20 @@ pub fn main() !void {
                 },
             }
         } else if (frame_callback_id == event.header.id and event.header.op == WL_CALLBACK_EVENT_DONE) {
-
-            // TODO: abstract away platform layers?
-            drawScene(scene, framebuffer, framebuffer_size);
-
+            if (total_frames > 0) {
+                // TODO: abstract away platform layers?
+                const elapsed_seconds = @as(f32, @floatFromInt(timer.read())) / 1_000_000_000.0;
+                drawScene(
+                    scene,
+                    framebuffer,
+                    framebuffer_size,
+                    elapsed_seconds,
+                );
+                try stdout.writeAll(std.mem.sliceAsBytes(framebuffer));
+                total_frames -= 1;
+            } else {
+                window_open = false;
+            }
             // Attach
             try writeRequest(
                 socket,
@@ -786,76 +803,127 @@ pub fn main() !void {
             std.log.warn("unknown event {{ .id = {any}, .op = {x}, .message = \"{any}\" }}", .{ event.header.id, event.header.op, std.zig.fmtString(std.mem.sliceAsBytes(event.data)) });
         }
     }
+    try stdout.flush();
 }
 
-pub fn drawScene(scene: Scene, framebuffer: [][4]u8, framebuffer_size: [2]usize) void {
-    const threshold = 1.0;
-    const r1 = scene.static.radius;
-    const r2 = scene.movable.radius;
-    const r1_squared = r1 * r1;
-    const r2_squared = r2 * r2;
+fn length(v: Vec2) f32 {
+    return @sqrt(v[0] * v[0] + v[1] * v[1]);
+}
+
+pub fn palette(t: f32) Vec3 {
+    const a: Vec3 = .{ 0.5, 0.5, 0.5 };
+    const b: Vec3 = .{ 0.5, 0.5, 0.5 };
+    const c: Vec3 = .{ 1.0, 1.0, 1.0 };
+    const d: Vec3 = .{ 0.263, 0.416, 0.557 };
+
+    const t_vec: Vec3 = .{ t, t, t };
+    const phase: Vec3 = c * t_vec + d;
+    const cos_val: Vec3 = .{
+        @cos(6.28318 * phase[0]),
+        @cos(6.28318 * phase[1]),
+        @cos(6.28318 * phase[2]),
+    };
+
+    return a + b * cos_val;
+}
+
+fn fract(v: Vec2) Vec2 {
+    return .{
+        v[0] - @floor(v[0]),
+        v[1] - @floor(v[1]),
+    };
+}
+
+// Video URL: https://youtu.be/f4s1h2YETNY
+pub fn drawScene(scene: Scene, framebuffer: [][4]u8, framebuffer_size: [2]usize, time: f32) void {
+    _ = scene;
+
+    const iTime = time;
+
+    const width_f: f32 = @floatFromInt(framebuffer_size[0]);
+    const height_f: f32 = @floatFromInt(framebuffer_size[1]);
+    const resolution: Vec2 = .{ width_f, height_f };
 
     for (0..framebuffer_size[1]) |y| {
         const row = framebuffer[y * framebuffer_size[0] .. (y + 1) * framebuffer_size[0]];
         for (row, 0..framebuffer_size[0]) |*pixel, x| {
-            const point: Vec2 = .{ @floatFromInt(x), @floatFromInt(y) };
-            // const inside_static = scene.static.isInside(point);
-            // const inside_movable = scene.movable.isInside(point);
+            const x_f: f32 = @floatFromInt(x);
+            const y_f: f32 = @floatFromInt(y);
+            const fragCoord: Vec2 = .{ x_f, y_f };
 
-            const dx1 = point[0] - scene.static.center[0];
-            const dy1 = point[1] - scene.static.center[1];
-            const d_squared1 = (dx1 * dx1) + (dy1 * dy1);
+            var uv = (fragCoord * @as(Vec2, .{ 2.0, 2.0 }) - resolution) / @as(Vec2, .{ height_f, height_f });
+            const uv0 = uv;
+            var finalColor: Vec3 = .{ 0.0, 0.0, 0.0 };
 
-            const dx2 = point[0] - scene.movable.center[0];
-            const dy2 = point[1] - scene.movable.center[1];
-            const d_squared2 = (dx2 * dx2) + (dy2 * dy2);
+            var i: f32 = 0.0;
+            while (i < 4.0) : (i += 1.0) {
+                uv = fract(uv * @as(Vec2, .{ 1.5, 1.5 })) - @as(Vec2, .{ 0.5, 0.5 });
 
-            const val1 = r1_squared / (d_squared1 + 0.0001);
-            const val2 = r2_squared / (d_squared2 + 0.0001);
-            const total_value = val1 + val2;
+                const d = length(uv) * @exp(-length(uv0));
 
-            if (total_value > threshold) {
-                const t = val2 / total_value;
-                const blended_color = scene.static.color.lerp(scene.movable.color, t);
+                const col = palette(length(uv0) + i * 0.4 + iTime * 0.4);
 
-                pixel.* = .{
-                    blended_color.b,
-                    blended_color.g,
-                    blended_color.r,
-                    0xFF,
-                };
-            } else {
-                pixel.* = .{ 0x00, 0x00, 0x00, 0xFF };
+                const sin_val = @sin(d * 8.0 + iTime) / 8.0;
+                const d_modified = @abs(sin_val);
+
+                const brightness = std.math.pow(f32, 0.01 / d_modified, 1.2);
+
+                finalColor += col * @as(Vec3, .{ brightness, brightness, brightness });
             }
 
-            // if (inside_movable and inside_static) {
-            //     const blended_color: Color = scene.static.color.lerp(scene.movable.color, 0.5);
-            //     pixel.* = .{
-            //         blended_color.b,
-            //         blended_color.g,
-            //         blended_color.r,
-            //         0xFF,
-            //     };
-            // } else if (inside_movable) {
-            //     pixel.* = .{
-            //         scene.movable.color.b,
-            //         scene.movable.color.g,
-            //         scene.movable.color.r,
-            //         0xFF,
-            //     };
-            // } else if (inside_static) {
-            //     pixel.* = .{
-            //         scene.static.color.b,
-            //         scene.static.color.g,
-            //         scene.static.color.r,
-            //         0xFF,
-            //     };
-            // } else {
-            //     pixel.* = .{ 0x00, 0x00, 0x00, 0xFF };
-            // }
+            const r_clamped = @min(1.0, @max(0.0, finalColor[0]));
+            const g_clamped = @min(1.0, @max(0.0, finalColor[1]));
+            const b_clamped = @min(1.0, @max(0.0, finalColor[2]));
+
+            const r: u8 = @intFromFloat(r_clamped * 255.0);
+            const g: u8 = @intFromFloat(g_clamped * 255.0);
+            const b: u8 = @intFromFloat(b_clamped * 255.0);
+
+            pixel.* = .{ b, g, r, 0xFF };
         }
     }
 }
+
+// pub fn drawScene(scene: Scene, framebuffer: [][4]u8, framebuffer_size: [2]usize) void {
+//     const threshold = 1.0;
+//     const r1 = scene.static.radius;
+//     const r2 = scene.movable.radius;
+//     const r1_squared = r1 * r1;
+//     const r2_squared = r2 * r2;
+
+//     for (0..framebuffer_size[1]) |y| {
+//         const row = framebuffer[y * framebuffer_size[0] .. (y + 1) * framebuffer_size[0]];
+//         for (row, 0..framebuffer_size[0]) |*pixel, x| {
+//             const point: Vec2 = .{ @floatFromInt(x), @floatFromInt(y) };
+
+//             const dx1 = point[0] - scene.static.center[0];
+//             const dy1 = point[1] - scene.static.center[1];
+//             const d_squared1 = (dx1 * dx1) + (dy1 * dy1);
+
+//             const dx2 = point[0] - scene.movable.center[0];
+//             const dy2 = point[1] - scene.movable.center[1];
+//             const d_squared2 = (dx2 * dx2) + (dy2 * dy2);
+
+//             const val1 = r1_squared / (d_squared1 + 0.0001);
+//             const val2 = r2_squared / (d_squared2 + 0.0001);
+//             const total_value = val1 + val2;
+
+//             if (total_value > threshold) {
+//                 const t = val2 / total_value;
+//                 const blended_color = scene.static.color.lerp(scene.movable.color, t);
+
+//                 pixel.* = .{
+//                     blended_color.b,
+//                     blended_color.g,
+//                     blended_color.r,
+//                     0xFF,
+//                 };
+//             } else {
+//                 pixel.* = .{ 0x00, 0x00, 0x00, 0xFF };
+//             }
+//         }
+//     }
+// }
 
 pub fn writeWlShmRequestCreatePool(
     socket: std.net.Stream,

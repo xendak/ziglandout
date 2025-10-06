@@ -2,6 +2,9 @@
 
 Final step of this project is just to make a simple game of lights out, but till i get there we display [Metaballs](https://en.wikipedia.org/wiki/Metaballs), then abstract away the platform layers and create the simple game.
 
+following a [shader guide](https://youtu.be/f4s1h2YETNY), actually generated:
+![](./output.mp4) 
+
 - currently learning audio.
 
 ### note to self
