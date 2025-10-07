@@ -468,7 +468,7 @@ pub fn main() !void {
     // create shared memory pool
     // allocate proper wl_buffer  (wl_shm_pool::create_buffer)
 
-    const framebuffer_size = [2]usize{ 512, 512 };
+    const framebuffer_size = [2]usize{ 1600, 900 };
 
     const shm_fd = try std.posix.memfd_create("zigland_framebuffer", 0);
     defer std.posix.close(shm_fd);
@@ -585,11 +585,9 @@ pub fn main() !void {
     var timer = try std.time.Timer.start();
     // var last_time: u64 = 0;
 
-    const framerate: u32 = 60;
-    const duration_seconds: f32 = 6.283;
-    var total_frames: u32 = @intFromFloat(duration_seconds * @as(f32, @floatFromInt(framerate)));
-
     // const time_step: f32 = 1.0 / @as(f32, @floatFromInt(framerate));
+
+    var metaballs = false;
 
     var stdout_buffer: [framebuffer_size[0] * framebuffer_size[1]]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
@@ -729,6 +727,7 @@ pub fn main() !void {
                     std.log.debug("Keyboard Leave: .serial {any} .surface {any}\n", .{ serial, surface });
                 },
                 wl_keyboard_key => {
+                    // TODO: get user inputs
                     const serial: u32 = @bitCast(event.data[0..4].*);
                     const time: u32 = @bitCast(event.data[4..8].*);
                     const key: u32 = @bitCast(event.data[8..12].*);
@@ -737,6 +736,11 @@ pub fn main() !void {
                     _ = serial;
                     _ = time;
                     std.log.debug("Key key{any} state{any}\n", .{ key, state });
+                    if (key == 16 and state == 1) {
+                        window_open = false;
+                    } else if (key == 57 and state == 1) {
+                        metaballs = !metaballs;
+                    }
                 },
                 wl_keyboard_modifiers => {
                     const serial: u32 = @bitCast(event.data[0..4].*);
@@ -747,15 +751,20 @@ pub fn main() !void {
 
                     _ = serial;
                     std.log.debug("Modifier: {any} {any} {any} {any}\n", .{ mods_depressed, mods_latched, mods_locked, groups });
-                    // TODO: get user inputs
                 },
                 else => {
                     std.log.warn("Keyboard event not tracked {{ .id = {any}, .op = {x}, .message = \"{any}\" }}", .{ event.header.id, event.header.op, std.zig.fmtString(std.mem.sliceAsBytes(event.data)) });
                 },
             }
         } else if (frame_callback_id == event.header.id and event.header.op == WL_CALLBACK_EVENT_DONE) {
-            if (total_frames > 0) {
-                // TODO: abstract away platform layers?
+            // TODO: abstract away platform layers?
+            if (metaballs) {
+                drawMetaBalls(
+                    scene,
+                    framebuffer,
+                    framebuffer_size,
+                );
+            } else {
                 const elapsed_seconds = @as(f32, @floatFromInt(timer.read())) / 1_000_000_000.0;
                 drawScene(
                     scene,
@@ -763,10 +772,6 @@ pub fn main() !void {
                     framebuffer_size,
                     elapsed_seconds,
                 );
-                try stdout.writeAll(std.mem.sliceAsBytes(framebuffer));
-                total_frames -= 1;
-            } else {
-                window_open = false;
             }
             // Attach
             try writeRequest(
@@ -884,46 +889,46 @@ pub fn drawScene(scene: Scene, framebuffer: [][4]u8, framebuffer_size: [2]usize,
     }
 }
 
-// pub fn drawScene(scene: Scene, framebuffer: [][4]u8, framebuffer_size: [2]usize) void {
-//     const threshold = 1.0;
-//     const r1 = scene.static.radius;
-//     const r2 = scene.movable.radius;
-//     const r1_squared = r1 * r1;
-//     const r2_squared = r2 * r2;
+pub fn drawMetaBalls(scene: Scene, framebuffer: [][4]u8, framebuffer_size: [2]usize) void {
+    const threshold = 1.0;
+    const r1 = scene.static.radius;
+    const r2 = scene.movable.radius;
+    const r1_squared = r1 * r1;
+    const r2_squared = r2 * r2;
 
-//     for (0..framebuffer_size[1]) |y| {
-//         const row = framebuffer[y * framebuffer_size[0] .. (y + 1) * framebuffer_size[0]];
-//         for (row, 0..framebuffer_size[0]) |*pixel, x| {
-//             const point: Vec2 = .{ @floatFromInt(x), @floatFromInt(y) };
+    for (0..framebuffer_size[1]) |y| {
+        const row = framebuffer[y * framebuffer_size[0] .. (y + 1) * framebuffer_size[0]];
+        for (row, 0..framebuffer_size[0]) |*pixel, x| {
+            const point: Vec2 = .{ @floatFromInt(x), @floatFromInt(y) };
 
-//             const dx1 = point[0] - scene.static.center[0];
-//             const dy1 = point[1] - scene.static.center[1];
-//             const d_squared1 = (dx1 * dx1) + (dy1 * dy1);
+            const dx1 = point[0] - scene.static.center[0];
+            const dy1 = point[1] - scene.static.center[1];
+            const d_squared1 = (dx1 * dx1) + (dy1 * dy1);
 
-//             const dx2 = point[0] - scene.movable.center[0];
-//             const dy2 = point[1] - scene.movable.center[1];
-//             const d_squared2 = (dx2 * dx2) + (dy2 * dy2);
+            const dx2 = point[0] - scene.movable.center[0];
+            const dy2 = point[1] - scene.movable.center[1];
+            const d_squared2 = (dx2 * dx2) + (dy2 * dy2);
 
-//             const val1 = r1_squared / (d_squared1 + 0.0001);
-//             const val2 = r2_squared / (d_squared2 + 0.0001);
-//             const total_value = val1 + val2;
+            const val1 = r1_squared / (d_squared1 + 0.0001);
+            const val2 = r2_squared / (d_squared2 + 0.0001);
+            const total_value = val1 + val2;
 
-//             if (total_value > threshold) {
-//                 const t = val2 / total_value;
-//                 const blended_color = scene.static.color.lerp(scene.movable.color, t);
+            if (total_value > threshold) {
+                const t = val2 / total_value;
+                const blended_color = scene.static.color.lerp(scene.movable.color, t);
 
-//                 pixel.* = .{
-//                     blended_color.b,
-//                     blended_color.g,
-//                     blended_color.r,
-//                     0xFF,
-//                 };
-//             } else {
-//                 pixel.* = .{ 0x00, 0x00, 0x00, 0xFF };
-//             }
-//         }
-//     }
-// }
+                pixel.* = .{
+                    blended_color.b,
+                    blended_color.g,
+                    blended_color.r,
+                    0xFF,
+                };
+            } else {
+                pixel.* = .{ 0x00, 0x00, 0x00, 0xFF };
+            }
+        }
+    }
+}
 
 pub fn writeWlShmRequestCreatePool(
     socket: std.net.Stream,

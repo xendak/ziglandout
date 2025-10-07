@@ -53,6 +53,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    audio.addCSourceFile(.{
+        .file = b.path("src/audio.c"),
+        .flags = &.{"-std=gnu99"},
+    });
+
     // audio.linkSystemLibrary2(
     //     "pipewire-0.3",
     //     .{ .use_pkg_config = .force },
