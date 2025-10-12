@@ -73,6 +73,7 @@ pub fn build(b: *std.Build) void {
     const audio_step = b.step("audio", "audio the app");
 
     const audio_cmd = b.addRunArtifact(audio);
+    audio_cmd.setCwd(b.path("./"));
     audio_step.dependOn(&audio_cmd.step);
 
     audio_cmd.step.dependOn(b.getInstallStep());
