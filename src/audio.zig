@@ -21,7 +21,7 @@ const DEFAULT_VOLUME = 0.7;
 const M_PI_M2 = std.math.pi + std.math.pi;
 
 const Data = struct {
-    loop: ?*c.pw_main_loop,
+    loop: ?*c.pw_thread_loop,
     stream: ?*c.pw_stream,
     sample_data: SampleData,
     position: usize,
@@ -34,7 +34,6 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
     var data: *Data = @ptrCast(@alignCast(user_data.?));
 
     if (!data.is_playing) {
-        _ = c.pw_main_loop_quit(data.loop);
         return;
     }
 
@@ -57,12 +56,7 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
 
     // Calculate how many frames we can actually write
     const frames_remaining = switch (data.sample_data) {
-        .pcm16 => |samples| samples.len / data.channels - data.position,
-        .pcm8 => |samples| samples.len / data.channels - data.position,
-        .pcm24 => |samples| samples.len / data.channels - data.position,
-        .pcm32 => |samples| samples.len / data.channels - data.position,
-        .float32 => |samples| samples.len / data.channels - data.position,
-        .float64 => |samples| samples.len / data.channels - data.position,
+        inline else => |samples| samples.len / data.channels - data.position,
     };
 
     const frames_to_write = @min(n_frames, frames_remaining);
@@ -89,19 +83,9 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
             const end_idx = start_idx + frames_to_write * data.channels;
 
             for (start_idx..end_idx) |i| {
-                // Correct conversion from u8 (0-255) to i16 (-32768 to 32767)
-                // 1. Cast the u8 sample to a wider integer type (like i32) to avoid overflow during calculations.
                 const u8_sample = @as(i32, samples[i]);
-
-                // 2. Scale the value.
-                //    A u8 value represents the high byte of a signed 16-bit sample,
-                //    so we shift it left by 8 bits (multiply by 256).
                 const scaled_sample = u8_sample * 256;
-
-                // 3. Offset the scaled sample to shift the range from [0, 65280]
-                //    to [-32768, 32512], which is approximately correct for PCM8.
                 const offset_sample: i16 = @intCast(scaled_sample - 32768);
-                // 4. Safely cast the result back to i16.
                 dst[i - start_idx] = @as(i16, offset_sample);
             }
         },
@@ -110,7 +94,6 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
             const end_idx = start_idx + frames_to_write * data.channels;
 
             for (start_idx..end_idx) |i| {
-                // Convert 24-bit to 16-bit (right shift by 8)
                 dst[i - start_idx] = @as(i16, @intCast(@as(i32, samples[i]) >> 8));
             }
         },
@@ -119,7 +102,6 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
             const end_idx = start_idx + frames_to_write * data.channels;
 
             for (start_idx..end_idx) |i| {
-                // Convert 32-bit to 16-bit (right shift by 16)
                 dst[i - start_idx] = @as(i16, @intCast(samples[i] >> 16));
             }
         },
@@ -128,7 +110,6 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
             const end_idx = start_idx + frames_to_write * data.channels;
 
             for (start_idx..end_idx) |i| {
-                // Convert float to 16-bit
                 const val = std.math.clamp(samples[i] * 32767.0, -32768.0, 32767.0);
                 dst[i - start_idx] = @as(i16, @intFromFloat(val));
             }
@@ -138,7 +119,6 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
             const end_idx = start_idx + frames_to_write * data.channels;
 
             for (start_idx..end_idx) |i| {
-                // Convert double to 16-bit
                 const val = std.math.clamp(samples[i] * 32767.0, -32768.0, 32767.0);
                 dst[i - start_idx] = @as(i16, @intFromFloat(val));
             }
@@ -158,9 +138,21 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
     _ = c.pw_stream_queue_buffer(data.stream, pw_buffer);
 }
 
+fn onStateChanged(user_data: ?*anyopaque, old_state: c.pw_stream_state, state: c.pw_stream_state, err: [*c]const u8) callconv(.c) void {
+    _ = old_state;
+    _ = err;
+
+    const data = @as(*Data, @ptrCast(@alignCast(user_data.?)));
+
+    if (state == c.PW_STREAM_STATE_STREAMING or state == c.PW_STREAM_STATE_ERROR) {
+        c.pw_thread_loop_signal(data.loop, false);
+    }
+}
+
 const stream_events = c.pw_stream_events{
     .version = c.PW_VERSION_STREAM_EVENTS,
     .process = onProcess,
+    .state_changed = onStateChanged,
 };
 
 const WavHeader = extern struct {
@@ -223,7 +215,6 @@ const Wav = struct {
     data: SampleData,
 
     pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        // allocator.free(self.data);
         self.data.deinit(allocator);
     }
 };
@@ -269,10 +260,6 @@ fn loadWave(allocator: std.mem.Allocator, file: []const u8) !Wav {
     printStruct(chunk_header);
     printStruct(format_chunk);
 
-    // Bits per sample analysis ?
-    // TODO: remake this i think?
-    // we need to properly read everything and still classify as pcm16 pcm32f pcm32_fle
-    // i think the order of the check is inversed here.. we know its pcm or extensible or iee before we analyze the bit sample
     var pos: usize = 0;
     var ext_chunk: ?ExtensibleChunk = null;
 
@@ -290,18 +277,14 @@ fn loadWave(allocator: std.mem.Allocator, file: []const u8) !Wav {
         format_chunk.fmt = switch (ext_format) {
             0x1 => .pcm,
             0x3 => .ieee,
-            else => return error.UnsupportedFormat,
+            else => return error.UnsupportedFormatEX,
         };
-        // format_chunk.bits_per_sample = ext_chunk.?.bits_per_sample;
 
         pos = (@sizeOf(WavHeader) + @sizeOf(ChunkHeader) + @sizeOf(FormatChunk) + @sizeOf(ExtensibleChunk)) / @sizeOf(u8);
     } else {
         pos = (@sizeOf(WavHeader) + @sizeOf(ChunkHeader) + @sizeOf(FormatChunk)) / @sizeOf(u8);
-        // may contain a format we dont support yet?
     }
 
-    // while we dont read "data", keep reading, ignore the strange formats?
-    // read by 4 bytes so we can do proper comparison?
     var delay_buffer = [_]u8{0} ** 4;
     while (!std.mem.eql(u8, "data", &delay_buffer)) {
         try reader.seekTo(pos);
@@ -316,7 +299,6 @@ fn loadWave(allocator: std.mem.Allocator, file: []const u8) !Wav {
     std.log.debug("delay_buffer: {s} | 0x{x}", .{ delay_buffer, delay_buffer });
     std.log.debug("data_size: {} | 0x{x}", .{ data_size, data_size });
 
-    // allocator.alignedAlloc(comptime T: type, comptime alignment: ?Alignment, n: usize)
     const raw_buffer = try allocator.alloc(u8, data_size);
     errdefer allocator.free(raw_buffer);
     bytes_read = reader.read(raw_buffer) catch {
@@ -337,13 +319,11 @@ fn loadWave(allocator: std.mem.Allocator, file: []const u8) !Wav {
     std.log.debug("data_size: {}", .{data_size});
 
     const sample_data = switch (format_chunk.fmt) {
-        .pcm, .extensible => blk: { // PCM
+        .pcm, .extensible => blk: {
             switch (format_chunk.bits_per_sample) {
                 8 => break :blk SampleData{ .pcm8 = raw_buffer },
                 16 => break :blk SampleData{ .pcm16 = @alignCast(std.mem.bytesAsSlice(i16, raw_buffer)) },
                 24 => {
-                    // zig has aligment of 4 for this.
-                    // assuming LE for now
                     const num_samples = raw_buffer.len / 3;
                     const samples = try allocator.alloc(i24, num_samples);
                     for (0..num_samples) |idx| {
@@ -359,14 +339,13 @@ fn loadWave(allocator: std.mem.Allocator, file: []const u8) !Wav {
 
                         samples[idx] = @intCast(val >> 8);
                     }
-                    // allocator.free(raw_buffer);
                     break :blk SampleData{ .pcm24 = samples };
                 },
                 32 => break :blk SampleData{ .pcm32 = @alignCast(std.mem.bytesAsSlice(i32, raw_buffer)) },
                 else => return error.UnsopportedBitsPerSample,
             }
         },
-        .ieee => blk: { // IEEE Float
+        .ieee => blk: {
             switch (format_chunk.bits_per_sample) {
                 32 => break :blk SampleData{ .float32 = @alignCast(std.mem.bytesAsSlice(f32, raw_buffer)) },
                 64 => break :blk SampleData{ .float64 = @alignCast(std.mem.bytesAsSlice(f64, raw_buffer)) },
@@ -401,7 +380,6 @@ fn printStruct(data: anytype) void {
                 field.name,
                 @field(data, field.name),
                 @field(data, field.name),
-                // field.type,
             });
         } else {
             std.debug.print("{s}: {any} | 0x{X}\n", .{
@@ -418,15 +396,18 @@ pub fn main() !void {
     defer _ = gpa_alloc.deinit();
     const gpa = gpa_alloc.allocator();
 
-    // const load = "./assets/full_scale_pcm16.wav";
-    // const load = "./assets/d_flat_pcm16.wav";
-    // const load = "./assets/sinewave_pcms32le.wav";
-    // const load = "./assets/M1F1-int32WE-AFsp.wav";
-    // const load = "./assets/M1F1-float32-AFsp.wav";
+    var argc = std.process.argsWithAllocator(gpa) catch return error.ErrorReadingArgs;
+    defer argc.deinit();
+    const p_name = argc.next().?;
+    std.log.info("Executing {s}", .{p_name});
     const load = "./assets/M1F1-float32WE-AFsp.wav";
-    // const load = "./assets/M1F1-float64-AFsp.wav";
-    // const load = "./assets/full_scale_pcm16.wav";
-    std.debug.print("Pipewire WAV Player, {s}\n", .{load});
+    const audio_name = argc.next() orelse load;
+    std.log.info("Audio: {s}", .{audio_name});
+    // while (argc.next()) |arg| {
+    //     std.log.info("{s}", .{arg});
+    // }
+
+    std.debug.print("Pipewire WAV Player\n\n", .{});
     const wave = try loadWave(gpa, load);
     defer wave.deinit(gpa);
 
@@ -470,8 +451,6 @@ pub fn main() !void {
         },
     };
 
-    // const fmt = switch(wave.fmt.)
-
     var audio_info = c.spa_audio_info_raw{
         .format = c.SPA_AUDIO_FORMAT_S16,
         .channels = data.channels,
@@ -489,11 +468,11 @@ pub fn main() !void {
     c.pw_init(null, null);
     defer c.pw_deinit();
 
-    data.loop = c.pw_main_loop_new(null);
-    defer c.pw_main_loop_destroy(data.loop);
+    data.loop = c.pw_thread_loop_new("wav-player", null);
+    defer c.pw_thread_loop_destroy(data.loop);
 
     data.stream = c.pw_stream_new_simple(
-        c.pw_main_loop_get_loop(data.loop),
+        c.pw_thread_loop_get_loop(data.loop),
         "wav-player",
         c.pw_properties_new(
             c.PW_KEY_MEDIA_TYPE,
@@ -523,7 +502,27 @@ pub fn main() !void {
         return error.StreamConnectFailed;
     }
 
+    if (c.pw_thread_loop_start(data.loop) < 0) {
+        std.log.err("Failed to start thread loop", .{});
+        return error.ThreadLoopStartFailed;
+    }
+    defer std.log.info("Playback finished", .{});
+    defer c.pw_thread_loop_stop(data.loop);
+
+    // Wait for the stream to be ready
+    c.pw_thread_loop_lock(data.loop);
+    c.pw_thread_loop_wait(data.loop);
+    c.pw_thread_loop_unlock(data.loop);
+
+    const stream_state = c.pw_stream_get_state(data.stream, null);
+    if (stream_state == c.PW_STREAM_STATE_ERROR) {
+        std.log.err("Stream error", .{});
+        return error.StreamError;
+    }
+
     std.log.info("Playing WAV file...", .{});
-    _ = c.pw_main_loop_run(data.loop);
-    std.log.info("Playback finished", .{});
+
+    while (data.is_playing) {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
 }
