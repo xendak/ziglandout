@@ -23,11 +23,12 @@ const M_PI_M2 = std.math.pi + std.math.pi;
 const Data = struct {
     loop: ?*c.pw_thread_loop,
     stream: ?*c.pw_stream,
-    sample_data: SampleData,
+    samples: []f32,
     position: usize,
     channels: u16,
     sample_rate: u32,
     is_playing: bool,
+    preferred_format: u16,
 };
 
 fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
@@ -44,9 +45,11 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
     }
 
     const spa_buffer: ?*c.spa_buffer = pw_buffer.?.buffer;
-    var dst: [*]i16 = @ptrCast(@alignCast(spa_buffer.?.datas[0].data));
+    var dst: [*]f32 = @ptrCast(@alignCast(spa_buffer.?.datas[0].data));
 
-    const stride = @sizeOf(i16) * data.channels;
+    // TODO: get preferred format eventually
+    const sample_size = @sizeOf(f32);
+    const stride = sample_size * data.channels;
     const max_frames = spa_buffer.?.datas[0].maxsize / stride;
     var n_frames = max_frames;
 
@@ -55,9 +58,7 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
     }
 
     // Calculate how many frames we can actually write
-    const frames_remaining = switch (data.sample_data) {
-        inline else => |samples| samples.len / data.channels - data.position,
-    };
+    const frames_remaining = data.samples.len / data.channels - data.position;
 
     const frames_to_write = @min(n_frames, frames_remaining);
 
@@ -68,62 +69,15 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
         return;
     }
 
-    // Write the audio data based on the format
-    switch (data.sample_data) {
-        .pcm16 => |samples| {
-            const start_idx = data.position * data.channels;
-            const end_idx = start_idx + frames_to_write * data.channels;
+    // Get the f32 samples we need to write
+    // adjust for position
+    const start_sample = data.position * data.channels;
+    const samples_to_write = frames_to_write * data.channels;
 
-            for (start_idx..end_idx) |i| {
-                dst[i - start_idx] = samples[i];
-            }
-        },
-        .pcm8 => |samples| {
-            const start_idx = data.position * data.channels;
-            const end_idx = start_idx + frames_to_write * data.channels;
+    const src_samples = data.samples[start_sample .. start_sample + samples_to_write];
+    const dst_slice = dst[0..samples_to_write];
 
-            for (start_idx..end_idx) |i| {
-                const u8_sample = @as(i32, samples[i]);
-                const scaled_sample = u8_sample * 256;
-                const offset_sample: i16 = @intCast(scaled_sample - 32768);
-                dst[i - start_idx] = @as(i16, offset_sample);
-            }
-        },
-        .pcm24 => |samples| {
-            const start_idx = data.position * data.channels;
-            const end_idx = start_idx + frames_to_write * data.channels;
-
-            for (start_idx..end_idx) |i| {
-                dst[i - start_idx] = @as(i16, @intCast(@as(i32, samples[i]) >> 8));
-            }
-        },
-        .pcm32 => |samples| {
-            const start_idx = data.position * data.channels;
-            const end_idx = start_idx + frames_to_write * data.channels;
-
-            for (start_idx..end_idx) |i| {
-                dst[i - start_idx] = @as(i16, @intCast(samples[i] >> 16));
-            }
-        },
-        .float32 => |samples| {
-            const start_idx = data.position * data.channels;
-            const end_idx = start_idx + frames_to_write * data.channels;
-
-            for (start_idx..end_idx) |i| {
-                const val = std.math.clamp(samples[i] * 32767.0, -32768.0, 32767.0);
-                dst[i - start_idx] = @as(i16, @intFromFloat(val));
-            }
-        },
-        .float64 => |samples| {
-            const start_idx = data.position * data.channels;
-            const end_idx = start_idx + frames_to_write * data.channels;
-
-            for (start_idx..end_idx) |i| {
-                const val = std.math.clamp(samples[i] * 32767.0, -32768.0, 32767.0);
-                dst[i - start_idx] = @as(i16, @intFromFloat(val));
-            }
-        },
-    }
+    @memcpy(dst_slice, src_samples);
 
     data.position += frames_to_write;
 
@@ -194,28 +148,14 @@ const WavFormat = enum(u16) {
     extensible = 0xFFFE,
 };
 
-const SampleData = union(enum) {
-    pcm8: []u8,
-    pcm16: []i16,
-    pcm24: []i24,
-    pcm32: []i32,
-    float32: []f32,
-    float64: []f64,
-
-    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        switch (self) {
-            inline else => |data| allocator.free(data),
-        }
-    }
-};
-
 const Wav = struct {
     fmt: FormatChunk,
-    extensible: ExtensibleChunk,
-    data: SampleData,
+    extensible: ?ExtensibleChunk,
+    // we're focing f32 internally
+    data: []f32,
 
     pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        self.data.deinit(allocator);
+        allocator.free(self.data);
     }
 };
 
@@ -275,7 +215,7 @@ fn loadWave(allocator: std.mem.Allocator, file: []const u8) !Wav {
         std.log.debug("ext_bits_per_sample: {}", .{ext_chunk.?.bits_per_sample});
         std.log.debug("ext_channel_mask: {}", .{ext_chunk.?.channel_mask});
         format_chunk.fmt = switch (ext_format) {
-            0x1 => .pcm,
+            0x0, 0x1 => .pcm,
             0x3 => .ieee,
             else => return error.UnsupportedFormatEX,
         };
@@ -300,7 +240,7 @@ fn loadWave(allocator: std.mem.Allocator, file: []const u8) !Wav {
     std.log.debug("data_size: {} | 0x{x}", .{ data_size, data_size });
 
     const raw_buffer = try allocator.alloc(u8, data_size);
-    errdefer allocator.free(raw_buffer);
+    defer allocator.free(raw_buffer);
     bytes_read = reader.read(raw_buffer) catch {
         return error.ReadFileError;
     };
@@ -318,44 +258,146 @@ fn loadWave(allocator: std.mem.Allocator, file: []const u8) !Wav {
     std.log.debug("fmt_size: {}", .{@sizeOf(FormatChunk)});
     std.log.debug("data_size: {}", .{data_size});
 
-    const sample_data = switch (format_chunk.fmt) {
-        .pcm, .extensible => blk: {
-            switch (format_chunk.bits_per_sample) {
-                8 => break :blk SampleData{ .pcm8 = raw_buffer },
-                16 => break :blk SampleData{ .pcm16 = @alignCast(std.mem.bytesAsSlice(i16, raw_buffer)) },
-                24 => {
-                    const num_samples = raw_buffer.len / 3;
-                    const samples = try allocator.alloc(i24, num_samples);
-                    for (0..num_samples) |idx| {
-                        const byte = idx * 3;
-                        const byte_0 = @as(i32, raw_buffer[byte]);
-                        const byte_1 = @as(i32, raw_buffer[byte + 1]);
-                        const byte_2 = @as(i32, raw_buffer[byte + 2]);
+    // convert everything to f32
+    const src_stride: u8 = @truncate(format_chunk.bits_per_sample / 8);
+    const samples = raw_buffer.len / src_stride;
+    std.log.debug("number_samples: {}", .{samples});
+    const f32_samples = allocator.alloc(f32, samples) catch return error.OutOfMemory;
 
-                        var val: i32 = 0;
-                        val |= @as(i32, byte_0) << 8;
-                        val |= @as(i32, byte_1) << 16;
-                        val |= @as(i32, byte_2) << 24;
+    const dst_stride = @sizeOf(f32);
+    const dst_bytes: []align(4) u8 = std.mem.sliceAsBytes(f32_samples);
 
-                        samples[idx] = @intCast(val >> 8);
-                    }
-                    break :blk SampleData{ .pcm24 = samples };
+    switch (format_chunk.bits_per_sample) {
+        8 => {
+            unsignedToFloat(u8, src_stride, raw_buffer, f32, dst_stride, dst_bytes, samples);
+        },
+        16 => {
+            signedToFloat(i16, src_stride, raw_buffer, f32, dst_stride, dst_bytes, samples);
+        },
+        24 => {
+            const i24_samples = try allocator.alloc(i24, samples);
+            defer allocator.free(i24_samples);
+
+            // Manually copy and convert each 3-byte sample to aligned i24
+            for (0..samples) |i| {
+                const bytes = raw_buffer[i * 3 ..][0..3];
+                // Read 3 bytes as little-endian i24
+                i24_samples[i] = std.mem.readInt(i24, bytes, .little);
+            }
+
+            // Now i24_samples is properly aligned, convert to f32
+            const i24_bytes: []align(4) u8 = std.mem.sliceAsBytes(i24_samples);
+            signedToFloat(i24, @sizeOf(i24), i24_bytes, f32, dst_stride, dst_bytes, samples);
+        },
+        32 => {
+            switch (format_chunk.fmt) {
+                .ieee => {
+                    @memcpy(f32_samples, std.mem.bytesAsSlice(f32, raw_buffer));
                 },
-                32 => break :blk SampleData{ .pcm32 = @alignCast(std.mem.bytesAsSlice(i32, raw_buffer)) },
-                else => return error.UnsopportedBitsPerSample,
+                .pcm, .extensible => {},
+                else => return error.UnsupportedFormat,
             }
+            signedToFloat(i32, src_stride, raw_buffer, f32, dst_stride, dst_bytes, samples);
         },
-        .ieee => blk: {
-            switch (format_chunk.bits_per_sample) {
-                32 => break :blk SampleData{ .float32 = @alignCast(std.mem.bytesAsSlice(f32, raw_buffer)) },
-                64 => break :blk SampleData{ .float64 = @alignCast(std.mem.bytesAsSlice(f64, raw_buffer)) },
-                else => return error.UnsopportedBitsPerSample,
+        64 => {
+            switch (format_chunk.fmt) {
+                .ieee => {
+                    // FIX: this is wrong :)
+                    const f64_samples: []align(1) f64 = std.mem.bytesAsSlice(f64, raw_buffer);
+                    for (f64_samples, 0..) |s, i| {
+                        f32_samples[i] = @as(f32, @floatCast(s));
+                    }
+                },
+                else => return error.UnsupportedFormat,
             }
+            signedToFloat(i32, src_stride, raw_buffer, f32, dst_stride, dst_bytes, samples);
         },
-        else => return error.UnsupportedFormat,
-    };
+        else => return error.UnsupportedBitsPerSample,
+    }
 
-    return .{ .fmt = format_chunk, .extensible = undefined, .data = sample_data };
+    return .{ .fmt = format_chunk, .extensible = ext_chunk, .data = f32_samples };
+}
+
+pub fn unsignedToFloat(
+    comptime SrcType: type,
+    src_stride: u8,
+    src: []const u8,
+    comptime DstType: type,
+    dst_stride: u8,
+    dst: []u8,
+    len: usize,
+) void {
+    const half_u = (std.math.maxInt(SrcType) + 1) / 2;
+    const half_f = @as(DstType, @floatFromInt(half_u));
+
+    const div_by_half_f = 1.0 / half_f;
+    var i: usize = 0;
+
+    // Use SIMD when available
+    if (std.simd.suggestVectorLength(SrcType)) |vec_size| {
+        const VecSrcType = @Vector(vec_size, SrcType);
+        const VecDstType = @Vector(vec_size, DstType);
+
+        // multiplies everything by half
+        const half_vec: VecDstType = @splat(half_f);
+        const block_len = len - (len % vec_size);
+
+        const div_by_half_f_vec: VecDstType = @splat(div_by_half_f);
+
+        while (i < block_len) : (i += vec_size) {
+            const src_values = std.mem.bytesAsValue(VecSrcType, src[i * src_stride ..][0 .. vec_size * src_stride]).*;
+
+            // int to float vector
+            const src_f_vec: VecDstType = @floatFromInt(src_values);
+            const sub_result: VecDstType = src_f_vec - half_vec;
+            const dst_vec: VecDstType = sub_result * div_by_half_f_vec;
+
+            @memcpy(dst[i * dst_stride ..][0 .. vec_size * dst_stride], std.mem.asBytes(&dst_vec)[0 .. vec_size * dst_stride]);
+        }
+    }
+
+    // Convert the remaining samples
+    while (i < len) : (i += 1) {
+        const src_sample: *const SrcType = @ptrCast(@alignCast(src[i * src_stride ..][0..src_stride]));
+
+        const src_sample_f = @as(DstType, @floatFromInt(src_sample.*));
+        const dst_sample: DstType = (src_sample_f - half_f) * div_by_half_f;
+
+        @memcpy(dst[i * dst_stride ..][0..dst_stride], std.mem.asBytes(&dst_sample)[0..dst_stride]);
+    }
+}
+
+pub fn signedToFloat(
+    comptime SrcType: type,
+    src_stride: u8,
+    src: []const u8,
+    comptime DstType: type,
+    dst_stride: u8,
+    dst: []u8,
+    len: usize,
+) void {
+    const div_by_max = 1.0 / @as(comptime_float, std.math.maxInt(SrcType) + 1);
+    var i: usize = 0;
+
+    // Use SIMD when available
+    if (std.simd.suggestVectorLength(SrcType)) |vec_size| {
+        const VecSrc = @Vector(vec_size, SrcType);
+        const VecDst = @Vector(vec_size, DstType);
+        const vec_blocks_len = len - (len % vec_size);
+        const div_by_max_vec: VecDst = @splat(div_by_max);
+        while (i < vec_blocks_len) : (i += vec_size) {
+            const src_vec = std.mem.bytesAsValue(VecSrc, src[i * src_stride ..][0 .. vec_size * src_stride]).*;
+            const dst_sample: VecDst = @as(VecDst, @floatFromInt(src_vec)) * div_by_max_vec;
+            @memcpy(dst[i * dst_stride ..][0 .. vec_size * dst_stride], std.mem.asBytes(&dst_sample)[0 .. vec_size * dst_stride]);
+        }
+    }
+
+    // Convert the remaining samples
+    while (i < len) : (i += 1) {
+        const src_sample: *const SrcType = @ptrCast(@alignCast(src[i * src_stride ..][0..src_stride]));
+        const dst_sample: DstType = @as(DstType, @floatFromInt(src_sample.*)) * div_by_max;
+        @memcpy(dst[i * dst_stride ..][0..dst_stride], std.mem.asBytes(&dst_sample)[0..dst_stride]);
+    }
 }
 
 fn printStruct(data: anytype) void {
@@ -408,31 +450,25 @@ pub fn main() !void {
     // }
 
     std.debug.print("Pipewire WAV Player\n\n", .{});
-    const wave = try loadWave(gpa, load);
+    const wave = try loadWave(gpa, audio_name);
     defer wave.deinit(gpa);
 
     std.log.debug("WAV loaded: {} channels, {} Hz, {} bits, {} samples\n", .{
         wave.fmt.num_channels,
         wave.fmt.sample_rate,
         wave.fmt.bits_per_sample,
-        switch (wave.data) {
-            .pcm8 => |d| d.len,
-            .pcm16 => |d| d.len,
-            .pcm24 => |d| d.len,
-            .pcm32 => |d| d.len,
-            .float32 => |d| d.len,
-            .float64 => |d| d.len,
-        } / wave.fmt.num_channels,
+        wave.data.len / wave.fmt.num_channels,
     });
 
     var data: Data = .{
         .loop = undefined,
         .stream = undefined,
-        .sample_data = wave.data,
+        .samples = wave.data,
         .position = 0,
         .channels = wave.fmt.num_channels,
         .sample_rate = wave.fmt.sample_rate,
         .is_playing = true,
+        .preferred_format = c.SPA_AUDIO_FORMAT_F32,
     };
 
     var buffer: [1024]u8 = undefined;
@@ -452,7 +488,7 @@ pub fn main() !void {
     };
 
     var audio_info = c.spa_audio_info_raw{
-        .format = c.SPA_AUDIO_FORMAT_S16,
+        .format = c.SPA_AUDIO_FORMAT_F32,
         .channels = data.channels,
         .rate = data.sample_rate,
     };

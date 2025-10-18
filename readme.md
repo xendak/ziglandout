@@ -42,9 +42,6 @@ Treat everything as files.
 
 When we receive frame_callback_id and WL_CALLBACK_EVENT_DONE, means we're on "vsync", i think. So we can draw to frame.
 
-
-
-
 ## Resources
 
 ### Wayland
@@ -55,9 +52,16 @@ When we receive frame_callback_id and WL_CALLBACK_EVENT_DONE, means we're on "vs
 - [Wayland Explorer](https://wayland.app/protocols/wayland#wl_surface:event:preferred_buffer_transform)
 - [Wayland From Scratch](https://gaultier.github.io/blog/wayland_from_scratch.html)
 
+### Wav
+ - [mmreg.h - Windows](https://learn.microsoft.com/en-us/windows/win32/api/mmeapi/ns-mmeapi-waveformatex)
+ - [docformat - wav](https://docs.fileformat.com/audio/wav/)
+ - [ranodm pdf](https://web.archive.org/web/20180225154501/https://wwwimages2.adobe.com/content/dam/acom/en/devnet/xmp/pdfs/XMP%20SDK%20Release%20cc-2016-08/XMPSpecificationPart3.pdf)
+
 ### Pipewire
 
-- [Pipewire tutorial](https://docs.pipewire.org/page_tutorial1.html)
+ - [Pipewire tutorial](https://docs.pipewire.org/page_tutorial1.html)
+ - [SDL3](https://github.com/libsdl-org/SDL/tree/427f838f5868271a89a85d1763e9abdef28ab63f/src/audio/pipewire)
+ - [Mach](https://github.com/hexops/mach/blob/8ef4227770880f69300e475c7c65f0ba1f2604a5/src/sysaudio/pipewire.zig)
 
 ## Acronyms
 
