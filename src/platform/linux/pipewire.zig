@@ -145,7 +145,7 @@ const Audio = struct {
         };
     }
 
-    pub fn triggerSfx(self: *@This(), clip: *const SoundClip) void {
+    pub fn playSFX(self: *@This(), clip: *const SoundClip) void {
         if (self.sfx) |*sfx| {
             if (sfx.isPlaying())
                 return;
@@ -260,12 +260,13 @@ fn onProcess(user_data: ?*anyopaque) callconv(.c) void {
         @memcpy(dst[write_region.region1.len..][0..write_region.region2.len], write_region.region2);
 
     const play_cursor_pos = data.sound_buffer.play_cursor.fetchAdd(samples_to_read, .monotonic);
-    std.log.debug("PlayCursor_pos: {}", .{play_cursor_pos});
+    _ = play_cursor_pos;
+    // std.log.debug("PlayCursor_pos: {}", .{play_cursor_pos});
 
     spa_buffer.?.datas[0].chunk.*.offset = 0;
     spa_buffer.?.datas[0].chunk.*.stride = @intCast(stride);
     // FIX: check this is it * stride or * sample_size
-    spa_buffer.?.datas[0].chunk.*.size = @intCast(samples_to_read * stride);
+    spa_buffer.?.datas[0].chunk.*.size = @intCast(samples_to_read * sample_size);
 }
 
 fn onStateChanged(
@@ -274,10 +275,11 @@ fn onStateChanged(
     state: c.pw_stream_state,
     err: [*c]const u8,
 ) callconv(.c) void {
-    _ = old_state;
     _ = err;
 
     const data = @as(*PipewireData, @ptrCast(@alignCast(user_data.?)));
+
+    std.log.info("State {} -> {}", .{ old_state, state });
 
     if (state == c.PW_STREAM_STATE_STREAMING or state == c.PW_STREAM_STATE_ERROR) {
         c.pw_thread_loop_signal(data.loop, false);
@@ -322,7 +324,6 @@ const ResampleError = error{
     OutOfMemory,
 };
 
-// i Think this is wrong
 // TODO: refactor this so that we can import anyfile and not just .wav
 // FIX: not dupe, but just return inplace?
 // this allocates memory the user needs to free
@@ -351,12 +352,14 @@ pub fn resampleSoundClip(
     const rate_ratio: f64 = dst_rate_f / src_rate_f;
 
     const src_frames = sound.data.len / channels;
-    const dst_frames = @as(usize, @intFromFloat(src_rate_f * rate_ratio));
+    const dst_frames = @as(usize, @intFromFloat(@as(f64, @floatFromInt(src_frames)) * rate_ratio));
+
     const dst_samples = dst_frames * channels;
 
     const resampled: []f32 = allocator.alloc(f32, dst_samples) catch return ResampleError.OutOfMemory;
     errdefer allocator.free(resampled);
 
+    // TODO: low pass filtering
     // linear interpolate
     for (0..dst_frames) |frame| {
         const frame_f: f64 = @floatFromInt(frame);
@@ -378,6 +381,7 @@ pub fn resampleSoundClip(
         }
     }
 
+    std.log.info("Resampling finished", .{});
     return SoundClip{
         .samples = resampled,
         .channels = channels,
@@ -398,67 +402,39 @@ pub fn main() !void {
     const audio_name = argc.next() orelse load;
     std.log.info("Audio: {s}", .{audio_name});
 
-    std.debug.print("Pipewire WAV Player\n\n", .{});
-    const sfx = try Wav.init(gpa, audio_name);
-    defer sfx.deinit(gpa);
+    std.debug.print("Loading Wav files\n", .{});
 
-    const bg_music = try Wav.init(gpa, "./assets/sinewave_pcms32le.wav");
-    defer bg_music.deinit(gpa);
+    const bg_sound: Wav = try Wav.init(gpa, "./assets/sinewave_pcms32le.wav");
+    defer bg_sound.deinit(gpa);
+    const noise: Wav = try Wav.init(gpa, audio_name);
+    defer noise.deinit(gpa);
 
-    std.log.debug("BG: WAV loaded: {} channels, {} Hz, {} bits, {} samples\n", .{
-        bg_music.fmt.num_channels,
-        bg_music.fmt.sample_rate,
-        bg_music.fmt.bits_per_sample,
-        bg_music.data.len / bg_music.fmt.num_channels,
-    });
-
-    std.log.debug("SFX: WAV loaded: {} channels, {} Hz, {} bits, {} samples\n", .{
-        sfx.fmt.num_channels,
-        sfx.fmt.sample_rate,
-        sfx.fmt.bits_per_sample,
-        sfx.data.len / sfx.fmt.num_channels,
-    });
-
-    const sfx_clip = try resampleSoundClip(gpa, sfx, bg_music.fmt.sample_rate);
+    const music_clip = SoundClip{
+        .samples = bg_sound.data,
+        .channels = bg_sound.fmt.num_channels,
+        .sample_rate = bg_sound.fmt.sample_rate,
+    };
+    const sfx_clip = try resampleSoundClip(gpa, noise, bg_sound.fmt.sample_rate);
     defer gpa.free(sfx_clip.samples);
 
-    const bg = SoundClip{
-        .samples = bg_music.data,
-        .channels = bg_music.fmt.num_channels,
-        .sample_rate = bg_music.fmt.sample_rate,
-    };
-
+    // Initialize the global sound buffer
     var sound_buffer = try SoundBuffer.init(gpa);
     defer sound_buffer.deinit(gpa);
 
-    var audio = Audio.init();
-    audio.playMusic(&bg);
+    // Initialize game audio state
+    var global_audio = Audio.init();
+    global_audio.playMusic(&music_clip);
 
-    // Pipewire Boilerplate
-
-    var data: PipewireData = .{
-        .loop = undefined,
-        .stream = undefined,
-        .sound_buffer = &sound_buffer,
-    };
-
+    // Setup PipeWire
     var buffer: [1024]u8 = undefined;
     var builder: c.spa_pod_builder = c.spa_pod_builder{
         .data = &buffer,
         .size = buffer.len,
         ._padding = 0,
-        .state = .{
-            .offset = 0,
-            .flags = 0,
-            .frame = null,
-        },
-        .callbacks = .{
-            .data = null,
-            .funcs = null,
-        },
+        .state = .{ .offset = 0, .flags = 0, .frame = null },
+        .callbacks = .{ .data = null, .funcs = null },
     };
 
-    // FIX: this to use proper stuff
     var audio_info = c.spa_audio_info_raw{
         .format = c.SPA_AUDIO_FORMAT_F32,
         .channels = DEFAULT_CHANNELS,
@@ -466,38 +442,40 @@ pub fn main() !void {
     };
 
     var params = [1][*c]c.spa_pod{
-        sysaudio_spa_format_audio_raw_build(
-            &builder,
-            c.SPA_PARAM_EnumFormat,
-            &audio_info,
-        ),
+        sysaudio_spa_format_audio_raw_build(&builder, c.SPA_PARAM_EnumFormat, &audio_info),
     };
 
     c.pw_init(null, null);
     defer c.pw_deinit();
 
-    data.loop = c.pw_thread_loop_new("wav-player", null);
-    defer c.pw_thread_loop_destroy(data.loop);
+    const pw_loop = c.pw_thread_loop_new("audio-loop", null);
+    defer c.pw_thread_loop_destroy(pw_loop);
 
-    data.stream = c.pw_stream_new_simple(
-        c.pw_thread_loop_get_loop(data.loop),
-        "wav-player",
+    var pw_data = PipewireData{
+        .loop = pw_loop,
+        .stream = undefined,
+        .sound_buffer = &sound_buffer,
+    };
+
+    pw_data.stream = c.pw_stream_new_simple(
+        c.pw_thread_loop_get_loop(pw_data.loop),
+        "casey-audio",
         c.pw_properties_new(
             c.PW_KEY_MEDIA_TYPE,
             "Audio",
             c.PW_KEY_MEDIA_CATEGORY,
             "Playback",
             c.PW_KEY_MEDIA_ROLE,
-            "Music",
+            "Game",
             @as(?*anyopaque, null),
         ),
         &stream_events,
-        &data,
+        &pw_data,
     );
-    defer c.pw_stream_destroy(data.stream);
+    defer c.pw_stream_destroy(pw_data.stream);
 
     const result = c.pw_stream_connect(
-        data.stream,
+        pw_data.stream,
         c.PW_DIRECTION_OUTPUT,
         c.PW_ID_ANY,
         c.PW_STREAM_FLAG_AUTOCONNECT | c.PW_STREAM_FLAG_MAP_BUFFERS | c.PW_STREAM_FLAG_RT_PROCESS,
@@ -510,64 +488,61 @@ pub fn main() !void {
         return error.StreamConnectFailed;
     }
 
-    if (c.pw_thread_loop_start(data.loop) < 0) {
-        std.log.err("Failed to start thread loop", .{});
+    if (c.pw_thread_loop_start(pw_loop) < 0) {
         return error.ThreadLoopStartFailed;
     }
-    defer std.log.info("Playback finished", .{});
-    defer c.pw_thread_loop_stop(data.loop);
+    defer c.pw_thread_loop_stop(pw_loop);
 
-    // Wait for the stream to be ready
-    c.pw_thread_loop_lock(data.loop);
-    c.pw_thread_loop_wait(data.loop);
-    c.pw_thread_loop_unlock(data.loop);
+    c.pw_thread_loop_lock(pw_loop);
+    c.pw_thread_loop_wait(pw_loop);
+    c.pw_thread_loop_unlock(pw_loop);
 
-    const stream_state = c.pw_stream_get_state(data.stream, null);
-    if (stream_state == c.PW_STREAM_STATE_ERROR) {
-        std.log.err("Stream error", .{});
-        return error.StreamError;
-    }
+    std.log.info("Playing Wav Files...", .{});
 
-    std.log.info("Playing WAV file...", .{});
-
-    // fps logic
-    var timer = try std.time.Timer.start();
+    // Timing logic
     const target_fps: f32 = 60.0;
-    const target_ns_per_frame: u64 = @intFromFloat(std.time.ns_per_s / target_fps);
-    var frame_count: u64 = 0;
-    // Mix loop
-    while (frame_count < 600) : (frame_count += 1) {
-        const start = timer.read();
+    const target_ns_per_frame = @as(u64, @intFromFloat(std.time.ns_per_s / target_fps));
 
-        const audio_time = AudioTime.calculate(&sound_buffer, target_fps);
-        if (audio_time.bytes_to_write > 0) {
+    var frame_count: u64 = 0;
+    var timer = try std.time.Timer.start();
+
+    while (frame_count < 600) : (frame_count += 1) {
+        const start: u64 = timer.read();
+
+        // calculate where to write
+        const audio_timing = AudioTime.calculate(&sound_buffer, target_fps);
+        if (audio_timing.bytes_to_write > 0) {
+            // write if needed.
             const write_cursor = sound_buffer.write_cursor.load(.monotonic);
             mixSounds(
-                &audio,
+                &global_audio,
                 &sound_buffer,
                 write_cursor,
-                audio_time.bytes_to_write,
+                audio_timing.bytes_to_write,
             );
-            sound_buffer.write_cursor.store(write_cursor + audio_time.bytes_to_write, .monotonic);
+
+            // 4. Update write cursor
+            sound_buffer.write_cursor.store(
+                write_cursor + audio_timing.bytes_to_write,
+                .monotonic,
+            );
         }
 
-        // play sound every now and then
+        // simulate playing sfx every now and then
         if (frame_count % 60 == 30) {
-            audio.triggerSfx(&sfx_clip);
+            global_audio.playSFX(&sfx_clip);
             std.log.info("Frame {}: Triggered sound effect", .{frame_count});
         }
 
-        // update time
-        const end = timer.read();
-        const elapsed = end - start;
+        const end: u64 = timer.read();
+        const elapsed: u64 = end - start;
+
+        // lets not burn our cpu
         if (elapsed < target_ns_per_frame) {
-            // we need to sleep till next cycle as we finished everything for this one.
-            // dont burn cpu?
             const sleep_ns = target_ns_per_frame - elapsed;
             std.Thread.sleep(sleep_ns);
         }
 
-        // log every second.
         if (frame_count % 60 == 0) {
             const play_cursor = sound_buffer.play_cursor.load(.monotonic);
             const write_cursor = sound_buffer.write_cursor.load(.monotonic);
@@ -578,4 +553,6 @@ pub fn main() !void {
             std.log.info("Audio buffer: {d:.2}ms ahead", .{delta_ms});
         }
     }
+
+    std.log.info("Playing finished", .{});
 }

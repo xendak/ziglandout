@@ -63,6 +63,10 @@ When we receive frame_callback_id and WL_CALLBACK_EVENT_DONE, means we're on "vs
  - [SDL3](https://github.com/libsdl-org/SDL/tree/427f838f5868271a89a85d1763e9abdef28ab63f/src/audio/pipewire)
  - [Mach](https://github.com/hexops/mach/blob/8ef4227770880f69300e475c7c65f0ba1f2604a5/src/sysaudio/pipewire.zig)
 
+### Audio
+
+ - [Lothar Reichel](https://www.math.kent.edu/~reichel/courses/intr.num.comp.2/)
+
 ## Acronyms
 
 | Name |        Description        |
