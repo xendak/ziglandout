@@ -47,14 +47,14 @@ pub fn build(b: *std.Build) void {
     const audio = b.addExecutable(.{
         .name = "zigaudio",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/audio.zig"),
+            .root_source_file = b.path("src/platform/linux/pipewire.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
 
     audio.addCSourceFile(.{
-        .file = b.path("src/audio.c"),
+        .file = b.path("src/platform/linux/audio.c"),
         .flags = &.{"-std=gnu99"},
     });
 
